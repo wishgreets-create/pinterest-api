@@ -29,6 +29,9 @@ def download():
             'no_warnings': True,
             'extract_flat': False,
             'socket_timeout': 30,
+            # Force MP4 with audio — no HLS streams
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'merge_output_format': 'mp4',
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -41,63 +44,74 @@ def download():
                 })
             
             formats = info.get('formats', [])
+            title = info.get('title', 'Pinterest Media')
+            thumbnail = info.get('thumbnail', None)
+            
             hd_url = None
             sd_url = None
-            thumbnail = info.get('thumbnail', None)
-            title = info.get('title', 'Pinterest Media')
-            media_type = 'video'
-            
-            # Get best quality videos
-            video_formats = [
+
+            # Filter only MP4 formats with both video and audio
+            mp4_av = [
                 f for f in formats
-                if f.get('vcodec') != 'none'
+                if f.get('ext') == 'mp4'
+                and f.get('vcodec', 'none') != 'none'
+                and f.get('acodec', 'none') != 'none'
                 and f.get('url')
-                and '.mp4' in f.get('url', '')
+                and 'm3u8' not in f.get('url', '')
+                and 'm3u8' not in f.get('protocol', '')
             ]
-            
-            if not video_formats:
-                video_formats = [
+
+            # Sort by height (quality)
+            mp4_av.sort(key=lambda x: x.get('height', 0) or 0, reverse=True)
+
+            if mp4_av:
+                hd_url = mp4_av[0].get('url')
+                if len(mp4_av) > 1:
+                    sd_url = mp4_av[-1].get('url')
+
+            # If no combined format, try video only MP4 (Pinterest usually has audio in it)
+            if not hd_url:
+                mp4_video = [
                     f for f in formats
-                    if f.get('vcodec') != 'none'
+                    if f.get('ext') == 'mp4'
+                    and f.get('vcodec', 'none') != 'none'
                     and f.get('url')
+                    and 'm3u8' not in f.get('url', '')
+                    and 'm3u8' not in f.get('protocol', '')
                 ]
-            
-            # Sort by quality
-            video_formats.sort(
-                key=lambda x: x.get('height', 0) or 0,
-                reverse=True
-            )
-            
-            if video_formats:
-                hd_url = video_formats[0].get('url')
-                if len(video_formats) > 1:
-                    sd_url = video_formats[-1].get('url')
-            
-            # Fallback
+                mp4_video.sort(key=lambda x: x.get('height', 0) or 0, reverse=True)
+                if mp4_video:
+                    hd_url = mp4_video[0].get('url')
+                    if len(mp4_video) > 1:
+                        sd_url = mp4_video[-1].get('url')
+
+            # Last resort — any non-HLS URL
+            if not hd_url:
+                for f in reversed(formats):
+                    fu = f.get('url', '')
+                    fp = f.get('protocol', '')
+                    if fu and 'm3u8' not in fu and 'm3u8' not in fp and f.get('vcodec','none') != 'none':
+                        hd_url = fu
+                        break
+
+            # Absolute fallback
             if not hd_url:
                 hd_url = info.get('url')
-            
-            if not hd_url:
-                # Try direct URL from formats
-                for f in formats:
-                    if f.get('url'):
-                        hd_url = f['url']
-                        break
-            
+
             if hd_url:
                 return jsonify({
                     'success': True,
-                    'type': media_type,
+                    'type': 'video',
                     'title': title,
                     'thumbnail': thumbnail,
                     'hd': hd_url,
-                    'sd': sd_url if sd_url != hd_url else None,
+                    'sd': sd_url if sd_url and sd_url != hd_url else None,
                     'url': hd_url
                 })
             else:
                 return jsonify({
                     'success': False,
-                    'error': 'No downloadable video found'
+                    'error': 'No MP4 video found'
                 })
                 
     except Exception as e:
