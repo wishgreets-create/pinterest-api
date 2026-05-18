@@ -9,7 +9,7 @@ CORS(app)
 
 @app.route('/')
 def home():
-    return jsonify({'status': 'running', 'message': 'Pinterest Downloader API'})
+    return jsonify({'status': 'running'})
 
 @app.route('/download')
 def download():
@@ -18,7 +18,6 @@ def download():
         return jsonify({'success': False, 'error': 'No URL provided'})
     
     try:
-        # Extract all formats
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -35,82 +34,73 @@ def download():
             formats = info.get('formats', [])
             title = info.get('title', 'Pinterest Media')
             thumbnail = info.get('thumbnail', None)
-            webpage_url = info.get('webpage_url', url)
             
             hd_url = None
             sd_url = None
-            hd_height = 0
 
-            # Pinterest videos: find formats with BOTH video+audio in mp4
-            combined = []
-            video_only = []
+            # First try: MP4 with audio (best case)
+            mp4_audio = [
+                f for f in formats
+                if f.get('ext') == 'mp4'
+                and f.get('vcodec','none') != 'none'
+                and f.get('acodec','none') != 'none'
+                and f.get('url')
+                and 'm3u8' not in f.get('url','')
+            ]
+            mp4_audio.sort(key=lambda x: x.get('height',0) or 0, reverse=True)
             
-            for f in formats:
-                fu = f.get('url', '')
-                fext = f.get('ext', '')
-                fv = f.get('vcodec', 'none')
-                fa = f.get('acodec', 'none')
-                fh = f.get('height', 0) or 0
-                fp = f.get('protocol', '')
-                
-                if not fu or fv == 'none':
-                    continue
-                    
-                # Skip HLS/DASH streams
-                if 'm3u8' in fp or 'dash' in fp:
-                    continue
-                if 'm3u8' in fu:
-                    continue
-                    
-                if fa != 'none':
-                    combined.append(f)
-                else:
-                    video_only.append(f)
+            if mp4_audio:
+                hd_url = mp4_audio[0]['url']
+                if len(mp4_audio) > 1:
+                    sd_url = mp4_audio[-1]['url']
 
-            # Sort by height descending
-            combined.sort(key=lambda x: x.get('height', 0) or 0, reverse=True)
-            video_only.sort(key=lambda x: x.get('height', 0) or 0, reverse=True)
-
-            if combined:
-                hd_url = combined[0].get('url')
-                if len(combined) > 1:
-                    sd_url = combined[-1].get('url')
-            elif video_only:
-                hd_url = video_only[0].get('url')
-                if len(video_only) > 1:
-                    sd_url = video_only[-1].get('url')
-
-            # If still nothing - Pinterest HLS only - use getmp4 endpoint
+            # Second try: any MP4 without HLS
             if not hd_url:
-                # Get best HLS URL
-                all_formats = info.get('formats', [])
-                for f in reversed(all_formats):
-                    fu = f.get('url', '')
-                    fv = f.get('vcodec', 'none')
-                    if fu and fv != 'none':
-                        hls_url = fu
-                        base = request.host_url.rstrip('/')
-                        # Return getmp4 endpoint which uses yt-dlp to merge
-                        encoded = urllib.parse.quote(webpage_url, safe='')
-                        return jsonify({
-                            'success': True,
-                            'type': 'video',
-                            'title': title,
-                            'thumbnail': thumbnail,
-                            'hd': f'{base}/getmp4?url={encoded}',
-                            'sd': None,
-                            'url': f'{base}/getmp4?url={encoded}'
-                        })
+                mp4_any = [
+                    f for f in formats
+                    if f.get('ext') == 'mp4'
+                    and f.get('vcodec','none') != 'none'
+                    and f.get('url')
+                    and 'm3u8' not in f.get('url','')
+                ]
+                mp4_any.sort(key=lambda x: x.get('height',0) or 0, reverse=True)
+                if mp4_any:
+                    hd_url = mp4_any[0]['url']
+                    if len(mp4_any) > 1:
+                        sd_url = mp4_any[-1]['url']
+
+            # Third try: HLS stream (has audio in it)
+            if not hd_url:
+                hls = [
+                    f for f in formats
+                    if f.get('vcodec','none') != 'none'
+                    and f.get('url')
+                ]
+                hls.sort(key=lambda x: x.get('height',0) or 0, reverse=True)
+                if hls:
+                    hd_url = hls[0]['url']
+                    if len(hls) > 1:
+                        sd_url = hls[-1]['url']
+
+            if not hd_url:
+                hd_url = info.get('url')
 
             if hd_url:
+                # Proxy the video through our server to fix CORS
+                base = request.host_url.rstrip('/')
+                hd_proxied = f"{base}/proxy?url={urllib.parse.quote(hd_url, safe='')}"
+                sd_proxied = f"{base}/proxy?url={urllib.parse.quote(sd_url, safe='')}" if sd_url else None
+                
                 return jsonify({
                     'success': True,
                     'type': 'video',
                     'title': title,
                     'thumbnail': thumbnail,
-                    'hd': hd_url,
-                    'sd': sd_url if sd_url and sd_url != hd_url else None,
-                    'url': hd_url
+                    'hd': hd_proxied,
+                    'sd': sd_proxied,
+                    'url': hd_proxied,
+                    'direct_hd': hd_url,
+                    'is_hls': '.m3u8' in hd_url
                 })
             else:
                 return jsonify({'success': False, 'error': 'No video found'})
@@ -119,78 +109,43 @@ def download():
         return jsonify({'success': False, 'error': str(e)})
 
 
-@app.route('/getmp4')
-def get_mp4():
-    """Download Pinterest video with audio using yt-dlp and stream it"""
-    pin_url = request.args.get('url')
-    if not pin_url:
+@app.route('/proxy')
+def proxy():
+    """Proxy video bytes to fix CORS and allow download"""
+    video_url = request.args.get('url')
+    if not video_url:
         return jsonify({'error': 'No URL'}), 400
 
     try:
-        import tempfile
-        import subprocess
+        import urllib.request as urlreq
         
-        # Create temp file
-        with tempfile.NamedTemporaryFile(
-            suffix='.mp4', 
-            delete=False,
-            dir='/tmp'
-        ) as tmp:
-            tmp_path = tmp.name
-
-        # Use yt-dlp to download with audio merged
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'outtmpl': tmp_path,
-            'format': 'bestvideo+bestaudio/best',
-            'merge_output_format': 'mp4',
-            'socket_timeout': 60,
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([pin_url])
-
-        # Check if file exists
-        # yt-dlp may add extension
-        actual_path = tmp_path
-        if not os.path.exists(actual_path):
-            actual_path = tmp_path + '.mp4'
-        if not os.path.exists(actual_path):
-            actual_path = tmp_path.replace('.mp4', '') + '.mp4'
-
-        if not os.path.exists(actual_path):
-            return jsonify({'error': 'Download failed'}), 500
-
-        def stream_file():
-            with open(actual_path, 'rb') as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
-            try:
-                os.unlink(actual_path)
-            except:
-                pass
-
-        file_size = os.path.getsize(actual_path)
-        
-        return Response(
-            stream_file(),
-            mimetype='video/mp4',
+        req = urlreq.Request(
+            video_url,
             headers={
-                'Content-Disposition': 'attachment; filename="pinterest_video.mp4"',
-                'Content-Length': str(file_size),
-                'Access-Control-Allow-Origin': '*',
-                'Cache-Control': 'no-cache'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://www.pinterest.com/',
             }
         )
         
+        response = urlreq.urlopen(req, timeout=30)
+        content_type = response.headers.get('Content-Type', 'video/mp4')
+        
+        def generate():
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        
+        return Response(
+            generate(),
+            mimetype='video/mp4',
+            headers={
+                'Content-Disposition': 'attachment; filename="pinterest_video.mp4"',
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'no-cache',
+            }
+        )
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
