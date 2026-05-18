@@ -2,9 +2,7 @@ from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import yt_dlp
 import os
-import subprocess
-import tempfile
-import threading
+import urllib.request
 
 app = Flask(__name__)
 CORS(app)
@@ -20,12 +18,13 @@ def download():
         return jsonify({'success': False, 'error': 'No URL provided'})
     
     try:
-        # First extract info
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
             'socket_timeout': 30,
+            # Get best format with audio
+            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best',
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -38,134 +37,119 @@ def download():
             title = info.get('title', 'Pinterest Media')
             thumbnail = info.get('thumbnail', None)
             
-            # Find best HLS or MP4 URL
             hd_url = None
             sd_url = None
-            hd_height = 0
-            sd_height = 0
 
-            for f in formats:
+            # Try to find MP4 with audio first
+            for f in reversed(formats):
                 fu = f.get('url', '')
-                fh = f.get('height', 0) or 0
+                fext = f.get('ext', '')
                 fv = f.get('vcodec', 'none')
+                fa = f.get('acodec', 'none')
+                fh = f.get('height', 0) or 0
                 
                 if not fu or fv == 'none':
                     continue
                 
-                if fh >= hd_height:
-                    sd_url = hd_url
-                    sd_height = hd_height
+                # Best: MP4 with both video and audio
+                if fext == 'mp4' and fa != 'none' and not hd_url:
                     hd_url = fu
-                    hd_height = fh
-                elif fh > sd_height and fh < hd_height:
+                    continue
+                    
+                if fext == 'mp4' and fa != 'none' and not sd_url and fu != hd_url:
                     sd_url = fu
-                    sd_height = fh
 
+            # If no MP4+audio found, get any video
+            if not hd_url:
+                for f in reversed(formats):
+                    fu = f.get('url', '')
+                    fv = f.get('vcodec', 'none')
+                    if fu and fv != 'none':
+                        hd_url = fu
+                        break
+
+            # Last fallback
             if not hd_url:
                 hd_url = info.get('url')
 
-            if not hd_url:
-                return jsonify({'success': False, 'error': 'No video URL found'})
+            if hd_url:
+                # Build download URL
+                base_url = request.host_url.rstrip('/')
+                
+                # If HLS, use proxy to add audio
+                if '.m3u8' in hd_url:
+                    dl_url = f'{base_url}/stream?url={urllib.parse.quote(hd_url)}'
+                else:
+                    dl_url = hd_url
 
-            # Return the stream URL with a proxy endpoint
-            return jsonify({
-                'success': True,
-                'type': 'video',
-                'title': title,
-                'thumbnail': thumbnail,
-                'hd': f'/proxy?url={hd_url}' if '.m3u8' in hd_url else hd_url,
-                'sd': (f'/proxy?url={sd_url}' if sd_url and '.m3u8' in sd_url else sd_url) if sd_url else None,
-                'url': f'/proxy?url={hd_url}' if '.m3u8' in hd_url else hd_url,
-                'stream': hd_url
-            })
+                sd_dl = None
+                if sd_url:
+                    if '.m3u8' in sd_url:
+                        sd_dl = f'{base_url}/stream?url={urllib.parse.quote(sd_url)}'
+                    else:
+                        sd_dl = sd_url
+
+                return jsonify({
+                    'success': True,
+                    'type': 'video',
+                    'title': title,
+                    'thumbnail': thumbnail,
+                    'hd': dl_url,
+                    'sd': sd_dl,
+                    'url': dl_url
+                })
+            else:
+                return jsonify({'success': False, 'error': 'No video found'})
                 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
 
-@app.route('/proxy')
-def proxy_stream():
-    """Stream HLS video as MP4 using ffmpeg"""
+@app.route('/stream')
+def stream_video():
+    """Stream HLS video with audio as MP4"""
+    import urllib.parse
     stream_url = request.args.get('url')
     if not stream_url:
         return jsonify({'error': 'No URL'}), 400
 
-    def generate():
-        try:
-            cmd = [
-                'ffmpeg',
-                '-i', stream_url,
-                '-c', 'copy',
-                '-movflags', 'frag_keyframe+empty_moov+faststart',
-                '-f', 'mp4',
-                'pipe:1'
-            ]
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=10**6
-            )
-            while True:
-                chunk = process.stdout.read(8192)
-                if not chunk:
-                    break
-                yield chunk
-            process.wait()
-        except Exception as e:
-            print(f'Stream error: {e}')
-
-    return Response(
-        generate(),
-        mimetype='video/mp4',
-        headers={
-            'Content-Disposition': 'attachment; filename="pinterest_video.mp4"',
-            'Access-Control-Allow-Origin': '*'
-        }
-    )
-
-
-@app.route('/getmp4')
-def get_mp4():
-    """Convert HLS to MP4 and return direct download"""
-    url = request.args.get('url')
-    if not url:
-        return jsonify({'error': 'No URL'}), 400
-
     try:
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
-            tmp_path = tmp.name
+        # Use yt-dlp to stream with audio merged
+        ydl_opts = {
+            'quiet': True,
+            'format': 'best',
+            'outtmpl': '-',
+        }
+        
+        # Get the direct URL with audio
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Try to find a direct URL from the m3u8
+            info = ydl.extract_info(stream_url, download=False)
+            if info:
+                # Look for mp4 format specifically
+                formats = info.get('formats', [])
+                for f in reversed(formats):
+                    fu = f.get('url', '')
+                    fa = f.get('acodec', 'none')
+                    fext = f.get('ext', '')
+                    if fu and fa != 'none' and fext == 'mp4':
+                        # Redirect to direct URL
+                        from flask import redirect
+                        return redirect(fu)
+                
+                # Fallback to best URL
+                best_url = info.get('url') or (formats[-1].get('url') if formats else None)
+                if best_url:
+                    from flask import redirect
+                    return redirect(best_url)
 
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', url,
-            '-c', 'copy',
-            '-movflags', 'faststart',
-            tmp_path
-        ]
-        subprocess.run(cmd, capture_output=True, timeout=120)
-
-        def stream_and_delete():
-            with open(tmp_path, 'rb') as f:
-                while True:
-                    chunk = f.read(8192)
-                    if not chunk:
-                        break
-                    yield chunk
-            os.unlink(tmp_path)
-
-        return Response(
-            stream_and_delete(),
-            mimetype='video/mp4',
-            headers={
-                'Content-Disposition': 'attachment; filename="pinterest_video.mp4"',
-                'Access-Control-Allow-Origin': '*'
-            }
-        )
+        return jsonify({'error': 'Could not process stream'}), 500
+        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':
+    import urllib.parse
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
