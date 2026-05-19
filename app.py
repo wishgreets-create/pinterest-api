@@ -1,8 +1,9 @@
-from flask import Flask, jsonify, request, Response, redirect
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import yt_dlp
 import os
 import urllib.parse
+import urllib.request
 
 app = Flask(__name__)
 CORS(app)
@@ -23,6 +24,7 @@ def download():
             'no_warnings': True,
             'extract_flat': False,
             'socket_timeout': 30,
+            'format': 'best',
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -31,123 +33,133 @@ def download():
             if not info:
                 return jsonify({'success': False, 'error': 'No media found'})
             
-            formats = info.get('formats', [])
             title = info.get('title', 'Pinterest Media')
             thumbnail = info.get('thumbnail', None)
+            formats = info.get('formats', [])
             
-            hd_url = None
-            sd_url = None
-
-            # First try: MP4 with audio (best case)
-            mp4_audio = [
-                f for f in formats
-                if f.get('ext') == 'mp4'
-                and f.get('vcodec','none') != 'none'
-                and f.get('acodec','none') != 'none'
-                and f.get('url')
-                and 'm3u8' not in f.get('url','')
-            ]
-            mp4_audio.sort(key=lambda x: x.get('height',0) or 0, reverse=True)
+            # Collect all video URLs with quality info
+            all_videos = []
             
-            if mp4_audio:
-                hd_url = mp4_audio[0]['url']
-                if len(mp4_audio) > 1:
-                    sd_url = mp4_audio[-1]['url']
-
-            # Second try: any MP4 without HLS
-            if not hd_url:
-                mp4_any = [
-                    f for f in formats
-                    if f.get('ext') == 'mp4'
-                    and f.get('vcodec','none') != 'none'
-                    and f.get('url')
-                    and 'm3u8' not in f.get('url','')
-                ]
-                mp4_any.sort(key=lambda x: x.get('height',0) or 0, reverse=True)
-                if mp4_any:
-                    hd_url = mp4_any[0]['url']
-                    if len(mp4_any) > 1:
-                        sd_url = mp4_any[-1]['url']
-
-            # Third try: HLS stream (has audio in it)
-            if not hd_url:
-                hls = [
-                    f for f in formats
-                    if f.get('vcodec','none') != 'none'
-                    and f.get('url')
-                ]
-                hls.sort(key=lambda x: x.get('height',0) or 0, reverse=True)
-                if hls:
-                    hd_url = hls[0]['url']
-                    if len(hls) > 1:
-                        sd_url = hls[-1]['url']
-
-            if not hd_url:
-                hd_url = info.get('url')
-
-            if hd_url:
-                # Proxy the video through our server to fix CORS
-                base = request.host_url.rstrip('/')
-                hd_proxied = f"{base}/proxy?url={urllib.parse.quote(hd_url, safe='')}"
-                sd_proxied = f"{base}/proxy?url={urllib.parse.quote(sd_url, safe='')}" if sd_url else None
+            for f in formats:
+                fu = f.get('url','')
+                fv = f.get('vcodec','none')
+                fh = f.get('height', 0) or 0
+                fext = f.get('ext','')
+                fa = f.get('acodec','none')
                 
-                return jsonify({
-                    'success': True,
-                    'type': 'video',
-                    'title': title,
-                    'thumbnail': thumbnail,
-                    'hd': hd_proxied,
-                    'sd': sd_proxied,
-                    'url': hd_proxied,
-                    'direct_hd': hd_url,
-                    'is_hls': '.m3u8' in hd_url
+                if not fu or fv == 'none':
+                    continue
+                    
+                all_videos.append({
+                    'url': fu,
+                    'height': fh,
+                    'ext': fext,
+                    'has_audio': fa != 'none',
+                    'is_hls': 'm3u8' in fu or 'm3u8' in f.get('protocol','')
                 })
-            else:
+            
+            # Sort: prefer audio+video, highest quality first
+            all_videos.sort(
+                key=lambda x: (
+                    x['has_audio'],
+                    not x['is_hls'],
+                    x['height']
+                ),
+                reverse=True
+            )
+            
+            if not all_videos:
+                direct = info.get('url')
+                if direct:
+                    all_videos = [{'url': direct, 'height': 0, 'has_audio': True, 'is_hls': 'm3u8' in direct}]
+            
+            if not all_videos:
                 return jsonify({'success': False, 'error': 'No video found'})
+            
+            best = all_videos[0]
+            second = all_videos[-1] if len(all_videos) > 1 else None
+            
+            base = request.host_url.rstrip('/')
+            
+            return jsonify({
+                'success': True,
+                'type': 'video',
+                'title': title,
+                'thumbnail': thumbnail,
+                'hd': best['url'],
+                'sd': second['url'] if second and second['url'] != best['url'] else None,
+                'url': best['url'],
+                'is_hls': best['is_hls'],
+                'has_audio': best['has_audio'],
+                'player_url': f"{base}/player?url={urllib.parse.quote(url, safe='')}"
+            })
                 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
 
-@app.route('/proxy')
-def proxy():
-    """Proxy video bytes to fix CORS and allow download"""
-    video_url = request.args.get('url')
-    if not video_url:
-        return jsonify({'error': 'No URL'}), 400
-
+@app.route('/player')
+def player():
+    """HTML5 video player page for the Pinterest video"""
+    pin_url = request.args.get('url')
+    if not pin_url:
+        return "No URL provided", 400
+    
     try:
-        import urllib.request as urlreq
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': 'best',
+        }
         
-        req = urlreq.Request(
-            video_url,
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Referer': 'https://www.pinterest.com/',
-            }
-        )
-        
-        response = urlreq.urlopen(req, timeout=30)
-        content_type = response.headers.get('Content-Type', 'video/mp4')
-        
-        def generate():
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(pin_url, download=False)
+            
+            formats = info.get('formats', [])
+            title = info.get('title', 'Pinterest Video')
+            
+            # Find best MP4 URL
+            video_url = None
+            for f in reversed(formats):
+                fu = f.get('url','')
+                fv = f.get('vcodec','none')
+                if fu and fv != 'none':
+                    video_url = fu
                     break
-                yield chunk
-        
-        return Response(
-            generate(),
-            mimetype='video/mp4',
-            headers={
-                'Content-Disposition': 'attachment; filename="pinterest_video.mp4"',
-                'Access-Control-Allow-Origin': '*',
-                'Cache-Control': 'no-cache',
-            }
-        )
+            
+            if not video_url:
+                video_url = info.get('url','')
+            
+            html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{ background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: sans-serif; }}
+video {{ max-width: 100%; max-height: 80vh; }}
+h3 {{ color: #fff; margin: 16px; text-align: center; font-size: 14px; }}
+.btn {{ background: #e60023; color: #fff; border: none; padding: 12px 28px; border-radius: 8px; font-size: 16px; cursor: pointer; margin: 12px; text-decoration: none; display: inline-block; }}
+p {{ color: #aaa; font-size: 12px; margin: 8px; text-align: center; }}
+</style>
+</head>
+<body>
+<h3>{title}</h3>
+<video controls autoplay playsinline>
+  <source src="{video_url}" type="video/mp4">
+  Your browser does not support video.
+</video>
+<p>On mobile: tap and hold the video → Save Video</p>
+<a href="{video_url}" download="pinterest_video.mp4" class="btn">⬇ Download MP4</a>
+</body>
+</html>"""
+            
+            return html
+            
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return f"Error: {str(e)}", 500
 
 
 if __name__ == '__main__':
